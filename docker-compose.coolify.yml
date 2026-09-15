@@ -1,0 +1,233 @@
+# =============================================================================
+# Kodus — compose adaptado para Coolify
+# =============================================================================
+# Base: docker-compose.yml do upstream (kodustech/kodus-installer).
+#
+# Diferenças em relação ao upstream (todas deliberadas, para rodar no Coolify):
+#   1. SEM redes externas. O upstream usa `shared-network`,
+#      `kodus-backend-services` e `monitoring-network` com `external: true`,
+#      que o install.sh cria no host. No Coolify elas não existem -> usamos a
+#      rede default do projeto (o Coolify conecta o stack ao proxy Traefik).
+#   2. SEM publicação de portas no host (`ports:`). Trocado por `expose:`; o
+#      Coolify/Traefik roteia os domínios. Evita conflito com outras apps do
+#      host (ex.: 3001 já usado pelo Prisma backend).
+#   3. `kodus-mcp-manager` atrás do profile `mcp` (desligado por padrão, igual
+#      ao comportamento do install.sh quando API_MCP_SERVER_ENABLED=false).
+#   4. `worker-analytics` continua atrás do profile `analytics`.
+#   5. `container_name` removido para o Coolify nomear os containers e evitar
+#      conflito entre stacks.
+#
+# Quando o `docker-compose.yml` do upstream mudar, o workflow
+# `.github/workflows/sync-upstream.yml` emite um aviso — revise este arquivo.
+# Serviços e portas: kodus-web:3000 | api:3001 | webhooks:3332 | mcp:3101
+# =============================================================================
+
+services:
+  kodus-web:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-ai-web:${IMAGE_TAG:-latest}
+    expose:
+      - "${WEB_PORT:-3000}"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    env_file:
+      - .env
+
+  api:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-ai-api:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    volumes:
+      - log_volume:/app/logs
+    logging:
+      options:
+        max-size: "200m"
+        max-file: "10"
+    expose:
+      - "3001"
+    environment:
+      - ENV=production
+      - NODE_ENV=production
+      - OBSERVABILITY_MONGO_ENABLED=${OBSERVABILITY_MONGO_ENABLED:-false}
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db_kodus_postgres:
+        condition: service_healthy
+      db_kodus_mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-ai-worker:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    volumes:
+      - log_volume:/app/logs
+    logging:
+      options:
+        max-size: "200m"
+        max-file: "10"
+    environment:
+      - ENV=production
+      - NODE_ENV=production
+      - OBSERVABILITY_MONGO_ENABLED=${OBSERVABILITY_MONGO_ENABLED:-false}
+      # Só o `api` roda migrations — ver nota no compose upstream.
+      - RUN_MIGRATIONS=false
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db_kodus_postgres:
+        condition: service_healthy
+      db_kodus_mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Analytics ingestion worker (Cockpit / Enterprise). Profile `analytics`.
+  worker-analytics:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-ai-worker:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    profiles:
+      - analytics
+    volumes:
+      - log_volume:/app/logs
+    logging:
+      options:
+        max-size: "200m"
+        max-file: "10"
+    environment:
+      - ENV=production
+      - NODE_ENV=production
+      - WORKER_ROLE=analytics
+      - OBSERVABILITY_MONGO_ENABLED=${OBSERVABILITY_MONGO_ENABLED:-false}
+      - RUN_MIGRATIONS=false
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db_kodus_postgres:
+        condition: service_healthy
+      db_kodus_mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  webhooks:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-ai-webhook:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    volumes:
+      - log_volume:/app/logs
+    logging:
+      options:
+        max-size: "200m"
+        max-file: "10"
+    expose:
+      - "${API_WEBHOOKS_PORT:-3332}"
+    environment:
+      - ENV=production
+      - NODE_ENV=production
+      - API_WEBHOOKS_PORT=${API_WEBHOOKS_PORT:-3332}
+      - OBSERVABILITY_MONGO_ENABLED=${OBSERVABILITY_MONGO_ENABLED:-false}
+      - RUN_MIGRATIONS=false
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db_kodus_postgres:
+        condition: service_healthy
+      db_kodus_mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # MCP Manager — opcional. Profile `mcp`; habilite com COMPOSE_PROFILES=mcp
+  # (e API_MCP_SERVER_ENABLED=true no .env).
+  kodus-mcp-manager:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-mcp-manager:${IMAGE_TAG:-latest}
+    platform: linux/amd64
+    profiles:
+      - mcp
+    expose:
+      - "${API_MCP_MANAGER_PORT:-3101}"
+    environment:
+      - NODE_ENV=${API_MCP_MANAGER_NODE_ENV:-production}
+      - API_MCP_MANAGER_NODE_ENV=${API_MCP_MANAGER_NODE_ENV:-production}
+      - OBSERVABILITY_MONGO_ENABLED=${OBSERVABILITY_MONGO_ENABLED:-false}
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  rabbitmq:
+    image: ${KODUS_REGISTRY:-ghcr.io/kodustech}/kodus-rabbitmq:4.2.2-kodus
+    hostname: ${RABBITMQ_HOSTNAME:-rabbitmq}
+    expose:
+      - "5672"
+      - "15672"
+      - "15692"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-kodus}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-kodus}
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit heartbeat 60
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - rabbitmq-data-prod:/var/lib/rabbitmq
+    command: /usr/local/bin/init-definitions.sh
+    restart: unless-stopped
+
+  db_kodus_postgres:
+    image: docker.io/pgvector/pgvector:pg16
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: ${API_PG_DB_USERNAME}
+      POSTGRES_PASSWORD: ${API_PG_DB_PASSWORD}
+      POSTGRES_DB: ${API_PG_DB_DATABASE}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${API_PG_DB_USERNAME} -d ${API_PG_DB_DATABASE}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  db_kodus_mongodb:
+    image: docker.io/mongo:8.2.11
+    expose:
+      - "27017"
+    volumes:
+      - mongodbdata:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${API_MG_DB_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${API_MG_DB_PASSWORD}
+      MONGO_INITDB_DATABASE: ${API_MG_DB_DATABASE}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "echo 'db.runCommand({ ping: 1 }).ok' | mongosh --quiet mongodb://$${MONGO_INITDB_ROOT_USERNAME}:$${MONGO_INITDB_ROOT_PASSWORD}@localhost:27017/admin | grep -q 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  log_volume:
+  rabbitmq-data-prod:
+  pgdata:
+  mongodbdata:

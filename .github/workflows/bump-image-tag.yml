@@ -1,0 +1,77 @@
+name: Bump Kodus image tag
+
+# Mantém o `IMAGE_TAG` (versão das imagens do Kodus) atualizado no Coolify.
+#
+# Por que existe: o Docker Compose puxa de `${IMAGE_TAG}` na env, NÃO do repo —
+# então o `bump-app-version.yml` do upstream (que só mexe no Helm chart) não
+# cobre o nosso caminho. Este workflow:
+#   1. resolve o release mais alto `selfhosted-X.Y.Z` do kodustech/kodus-ai;
+#   2. atualiza a env IMAGE_TAG do app no Coolify via API;
+#   3. dispara o deploy.
+#
+# Pinado de propósito (dá rollback). Para forçar uma versão, rode manualmente
+# com o input `version`.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'      # segunda-feira, 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão a fixar (vazio = último release selfhosted-*)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target version
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WANT="${{ inputs.version }}"
+          if [ -z "$WANT" ]; then
+            WANT=$(gh api repos/kodustech/kodus-ai/releases --paginate \
+                     --jq '.[] | select(.draft == false and (.tag_name | startswith("selfhosted-"))) | .tag_name' \
+                   | sed 's/^selfhosted-//' \
+                   | sort -V | tail -1)
+          fi
+          [ -n "$WANT" ] || { echo "::error::não encontrei nenhum release selfhosted-*"; exit 1; }
+          echo "version=$WANT"
+          echo "version=$WANT" >> "$GITHUB_OUTPUT"
+
+      - name: Atualizar IMAGE_TAG no Coolify
+        env:
+          COOLIFY_BASE_URL: ${{ secrets.COOLIFY_BASE_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COOLIFY_APP_UUID:-}" ]; then
+            echo "::warning::COOLIFY_APP_UUID não configurado — nada a fazer."; exit 0
+          fi
+          V="${{ steps.target.outputs.version }}"
+          BODY=$(jq -n --arg v "$V" '{key:"IMAGE_TAG", value:$v}')
+          curl -fsS -X PATCH "${COOLIFY_BASE_URL}/api/v1/applications/${COOLIFY_APP_UUID}/envs" \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY"
+          echo "IMAGE_TAG -> $V"
+
+      - name: Trigger Coolify deploy
+        env:
+          COOLIFY_BASE_URL: ${{ secrets.COOLIFY_BASE_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+        run: |
+          set -euo pipefail
+          [ -n "${COOLIFY_APP_UUID:-}" ] || exit 0
+          curl -fsS "${COOLIFY_BASE_URL}/api/v1/deploy?uuid=${COOLIFY_APP_UUID}" \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}"
+          echo "Deploy disparado com IMAGE_TAG=${{ steps.target.outputs.version }}."

@@ -1,0 +1,83 @@
+name: Sync from upstream
+
+# Mantém o fork alinhado com kodustech/kodus-installer.
+# Usa a API merge-upstream (o mesmo mecanismo do botão "Sync fork"):
+# fast-forward quando possível, merge quando o fork tem commits próprios
+# (os nossos workflows + o compose do Coolify). Conflito real falha alto.
+#
+# Depois de sincronizar, dispara o deploy no Coolify — então "upstream mudou"
+# vira "produção atualizada" sem intervenção, e sem depender de webhook do Git.
+#
+# Se o upstream mexer em `.github/workflows/**`, o GITHUB_TOKEN não consegue
+# mergear (falta escopo `workflow`): nesse caso crie o secret SYNC_FORK_TOKEN
+# com um PAT que tenha `repo` + `workflow`.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # a cada 6 horas
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Record current HEAD
+        id: head
+        run: echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_FORK_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          OUT=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::merge-upstream falhou (HTTP/erro). Se for conflito, resolva manualmente; se for 'workflow scope', crie o secret SYNC_FORK_TOKEN."
+            exit 1
+          fi
+          if printf '%s' "$OUT" | grep -qi 'up-to-date'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Já está atualizado."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Avisar se o compose upstream mudou
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git fetch -q origin main
+          if git diff --name-only "${{ steps.head.outputs.before }}" origin/main -- docker-compose.yml | grep -q .; then
+            echo "::warning title=Compose upstream mudou::docker-compose.yml do upstream mudou. Revise docker-compose.coolify.yml para refletir a mudança."
+          fi
+
+      - name: Trigger Coolify deploy
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          COOLIFY_BASE_URL: ${{ secrets.COOLIFY_BASE_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COOLIFY_APP_UUID:-}" ]; then
+            echo "::warning::COOLIFY_APP_UUID não configurado — pulando deploy."
+            exit 0
+          fi
+          curl -fsS "${COOLIFY_BASE_URL}/api/v1/deploy?uuid=${COOLIFY_APP_UUID}" \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}"
+          echo "Deploy disparado no Coolify."
